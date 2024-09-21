@@ -2,8 +2,8 @@ import math
 from os.path import exists
 
 from tqdm import trange
-from modules import scripts, shared, processing, sd_samplers, script_callbacks, rng
-from modules import devices, prompt_parser, sd_models, extra_networks
+from modules import scripts, shared, processing,  sd_schedulers, sd_samplers, script_callbacks, rng
+from modules import images, devices, prompt_parser, sd_models, ui_components, sd_models, extra_networks
 import modules.images as images
 import k_diffusion
 
@@ -12,7 +12,12 @@ import numpy as np
 from PIL import Image, ImageEnhance
 import torch
 import importlib
+from copy import copy
+from PIL import Image
+import json
+import gradio as gr
 
+quote_swap = str.maketrans('\'"', '"\'')
 
 def safe_import(import_name, pkg_name = None):
     try:
@@ -46,16 +51,19 @@ class CustomHiresFix(scripts.Script):
         self.config: DictConfig = OmegaConf.load(config_path)
         self.callback_set = False
         self.orig_clip_skip = None
-        self.orig_cfg = None
+        self.cfg = 0
         self.p: processing.StableDiffusionProcessing = None
         self.pp = None
         self.sampler = None
         self.cond = None
         self.uncond = None
+        self.prompt = ""
+        self.negative_prompt = ""
         self.step = None
         self.tv = None
         self.width = None
         self.height = None
+        self.extra_data = None
         self.use_cn = False
         self.external_code = None
         self.cn_image = None
@@ -66,8 +74,11 @@ class CustomHiresFix(scripts.Script):
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
-
+    
     def ui(self, is_img2img):
+        sampler_names = ['Restart + DPM++ 3M SDE'] + [x.name for x in sd_samplers.visible_samplers()]
+        scheduler_names = ['Use same scheduler'] + [x.label for x in sd_schedulers.schedulers]
+        
         with gr.Accordion(label='Custom hires fix', open=False):
             enable = gr.Checkbox(label='Enable extension', value=self.config.get('enable', False))
             with gr.Row():
@@ -80,14 +91,15 @@ class CustomHiresFix(scripts.Script):
                 steps = gr.Slider(minimum=8, maximum=25, step=1,
                                   label="Steps",
                                   value=self.config.get('steps', 15))
+                
             with gr.Row():
                 prompt = gr.Textbox(label='Prompt for upscale (added to generation prompt)',
                                     placeholder='Leave empty for using generation prompt',
-                                    value=self.config.get('prompt', ''))
+                                    value=self.prompt)
             with gr.Row():
                 negative_prompt = gr.Textbox(label='Negative prompt for upscale (replaces generation prompt)',
                                              placeholder='Leave empty for using generation negative prompt',
-                                             value=self.config.get('negative_prompt', ''))
+                                             value=self.negative_prompt)
             with gr.Row():
                 first_upscaler = gr.Dropdown([*[x.name for x in shared.sd_upscalers
                                                 if x.name not in ['None', 'Nearest', 'LDSR']]],
@@ -127,10 +139,11 @@ class CustomHiresFix(scripts.Script):
                                                  value=self.config.get('start_control_at', 0.0))
                     cn_ref = gr.Checkbox(label='Use last image for reference', value=self.config.get('cn_ref', False))
                 with gr.Row():
-                    sampler = gr.Dropdown(['Restart', 'DPM++ 2M SDE', 'DPM++ 3M SDE', 'Restart + DPM++ 3M SDE'],
-                                     label='Sampler',
-                                     value=self.config.get('sampler', 'DPM++ 2M SDE'))
-
+                    sampler = gr.Dropdown(sampler_names, label='Sampler', value=sampler_names[0])
+                    scheduler = gr.Dropdown(label='Schedule type', elem_id=f"{self.tabname}_scheduler", choices=scheduler_names, value=scheduler_names[0])
+                    cfg = gr.Slider(minimum=0, maximum=30, step=0.5, label="CFG Scale", value=self.cfg)
+                    
+                    
         if is_img2img:
             width.change(fn=lambda x: gr.update(value=0), inputs=width, outputs=height)
             height.change(fn=lambda x: gr.update(value=0), inputs=height, outputs=width)
@@ -139,7 +152,7 @@ class CustomHiresFix(scripts.Script):
             height.change(fn=lambda x: gr.update(value=0), inputs=height, outputs=width)
 
         ui = [enable, width, height, steps, first_upscaler, second_upscaler, first_latent, second_latent, prompt, 
-              negative_prompt, strength, filter, filter_offset, denoise_offset, clip_skip, sampler, cn_ref, start_control_at]
+              negative_prompt, strength, filter, filter_offset, denoise_offset, clip_skip, sampler, cfg, scheduler, cn_ref, start_control_at]
         for elem in ui:
             setattr(elem, "do_not_save_to_config", True)
         return ui
@@ -158,7 +171,7 @@ class CustomHiresFix(scripts.Script):
         
     def postprocess_image(self, p, pp: scripts.PostprocessImageArgs,
                           enable, width, height, steps, first_upscaler, second_upscaler, first_latent, second_latent, prompt,
-                          negative_prompt, strength, filter, filter_offset, denoise_offset, clip_skip, sampler, cn_ref, start_control_at
+                          negative_prompt, strength, filter, filter_offset, denoise_offset, clip_skip, sampler, cfg, scheduler, cn_ref, start_control_at
                           ):
         if not enable:
             return
@@ -182,7 +195,7 @@ class CustomHiresFix(scripts.Script):
         self.config.cn_ref = cn_ref
         self.config.start_control_at = start_control_at
         self.orig_clip_skip = shared.opts.CLIP_stop_at_last_layers
-        self.orig_cfg = p.cfg_scale
+        self.cfg = cfg if cfg else p.cfg_scale
         
         if clip_skip > 0:
             shared.opts.CLIP_stop_at_last_layers = clip_skip
@@ -190,10 +203,10 @@ class CustomHiresFix(scripts.Script):
             self.sampler = sd_samplers.create_sampler('Restart', p.sd_model)
         else:
             self.sampler = sd_samplers.create_sampler(sampler, p.sd_model)
-
+            
         def denoise_callback(params: script_callbacks.CFGDenoiserParams):
             if params.sampling_step > 0:
-                p.cfg_scale = self.orig_cfg
+                p.cfg_scale = self.cfg
             if self.step == 1 and self.config.strength != 1.0:
                 params.sigma[-1] = params.sigma[0] * (1 - (1 - self.config.strength) / 100)
             elif self.step == 2 and self.config.filter == 'Noise sync (sharp)':
@@ -222,7 +235,7 @@ class CustomHiresFix(scripts.Script):
         pp.image = x
         extra_networks.deactivate(p, loras_act)
         OmegaConf.save(self.config, config_path)
-
+        
     def enable_cn(self, image: np.ndarray):
         for unit in self.cn_units:
             if unit.model != 'None':
@@ -304,7 +317,7 @@ class CustomHiresFix(scripts.Script):
         noise = kornia.augmentation.RandomGaussianNoise(mean=0.0, std=1.0, p=1.0)(noise)
         steps = int(max(((self.p.steps - self.config.steps) / 2) + self.config.steps, self.config.steps))
         self.p.denoising_strength = 0.45 + self.config.denoise_offset * 0.2
-        self.p.cfg_scale = self.orig_cfg + 3
+        self.p.cfg_scale = self.cfg + 3
 
         def denoiser_override(n):
             sigmas = k_diffusion.sampling.get_sigmas_polyexponential(n, 0.01, 15, 0.5, devices.device)
@@ -331,7 +344,8 @@ class CustomHiresFix(scripts.Script):
         x_sample = x_sample.astype(np.uint8)
         image = Image.fromarray(x_sample)
         return image
-
+        
+            
     def filter(self, x):
         if 'Restart' == self.config.sampler:
             self.sampler = sd_samplers.create_sampler('Restart', shared.sd_model)
@@ -379,7 +393,7 @@ class CustomHiresFix(scripts.Script):
         noise = torch.zeros_like(sample)
         noise = kornia.augmentation.RandomGaussianNoise(mean=0.0, std=1.0, p=1.0)(noise)
         self.p.denoising_strength = 0.45 + self.config.denoise_offset
-        self.p.cfg_scale = self.orig_cfg + 3
+        self.p.cfg_scale = self.cfg + 3
 
         if self.config.filter == 'Morphological (smooth)':
             noise_mask = kornia.morphology.gradient(sample, torch.ones(5, 5).to(devices.device))
